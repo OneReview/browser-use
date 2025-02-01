@@ -97,6 +97,9 @@ class BrowserContextConfig:
 		allowed_domains: None
 			List of allowed domains that can be accessed. If None, all domains are allowed.
 			Example: ['example.com', 'api.example.com']
+
+		include_dynamic_attributes: bool = True
+			Include dynamic attributes in the CSS selector. If you want to reuse the css_selectors, it might be better to set this to False.
 	"""
 
 	cookies_file: str | None = None
@@ -121,6 +124,7 @@ class BrowserContextConfig:
 	highlight_elements: bool = True
 	viewport_expansion: int = 500
 	allowed_domains: list[str] | None = None
+	include_dynamic_attributes: bool = True
 
 
 @dataclass
@@ -711,7 +715,9 @@ class BrowserContext:
 	# endregion
 
 	# region - User Actions
-	def _convert_simple_xpath_to_css_selector(self, xpath: str) -> str:
+
+	@classmethod
+	def _convert_simple_xpath_to_css_selector(cls, xpath: str) -> str:
 		"""Converts simple XPath expressions to CSS selectors."""
 		if not xpath:
 			return ''
@@ -758,7 +764,8 @@ class BrowserContext:
 		base_selector = ' > '.join(css_parts)
 		return base_selector
 
-	def _enhanced_css_selector_for_element(self, element: DOMElementNode) -> str:
+	@classmethod
+	def _enhanced_css_selector_for_element(cls, element: DOMElementNode, include_dynamic_attributes: bool = True) -> str:
 		"""
 		Creates a CSS selector for a DOM element, handling various edge cases and special characters.
 
@@ -770,10 +777,10 @@ class BrowserContext:
 		"""
 		try:
 			# Get base selector from XPath
-			css_selector = self._convert_simple_xpath_to_css_selector(element.xpath)
+			css_selector = cls._convert_simple_xpath_to_css_selector(element.xpath)
 
 			# Handle class attributes
-			if 'class' in element.attributes and element.attributes['class']:
+			if 'class' in element.attributes and element.attributes['class'] and include_dynamic_attributes:
 				# Define a regex pattern for valid class names in CSS
 				valid_class_name_pattern = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_-]*$')
 
@@ -794,11 +801,11 @@ class BrowserContext:
 
 			# Expanded set of safe attributes that are stable and useful for selection
 			SAFE_ATTRIBUTES = {
-				# Standard HTML attributes
+				# Data attributes (if they're stable in your application)
 				'id',
+				# Standard HTML attributes
 				'name',
 				'type',
-				'value',
 				'placeholder',
 				# Accessibility attributes
 				'aria-label',
@@ -814,15 +821,19 @@ class BrowserContext:
 				'alt',
 				'title',
 				'src',
-				# Data attributes (if they're stable in your application)
-				'data-testid',
-				'data-id',
-				'data-qa',
-				'data-cy',
 				# Custom stable attributes (add any application-specific ones)
 				'href',
 				'target',
 			}
+
+			if include_dynamic_attributes:
+				dynamic_attributes = {
+					'data-id',
+					'data-qa',
+					'data-cy',
+					'data-testid',
+				}
+				SAFE_ATTRIBUTES.update(dynamic_attributes)
 
 			# Handle other attributes
 			for attribute, value in element.attributes.items():
@@ -859,7 +870,7 @@ class BrowserContext:
 			tag_name = element.tag_name or '*'
 			return f"{tag_name}[highlight_index='{element.highlight_index}']"
 
-	async def get_locate_element(self, element: DOMElementNode) -> ElementHandle | None:
+	async def get_locate_element(self, element: DOMElementNode) -> Optional[ElementHandle]:
 		current_frame = await self.get_current_page()
 
 		# Start with the target element and collect all parents
@@ -876,20 +887,26 @@ class BrowserContext:
 		# Process all iframe parents in sequence
 		iframes = [item for item in parents if item.tag_name == 'iframe']
 		for parent in iframes:
-			css_selector = self._enhanced_css_selector_for_element(parent)
+			css_selector = self._enhanced_css_selector_for_element(
+				parent, include_dynamic_attributes=self.config.include_dynamic_attributes
+			)
 			current_frame = current_frame.frame_locator(css_selector)
 
-		css_selector = self._enhanced_css_selector_for_element(element)
+		css_selector = self._enhanced_css_selector_for_element(
+			element, include_dynamic_attributes=self.config.include_dynamic_attributes
+		)
 
 		try:
 			if isinstance(current_frame, FrameLocator):
-				return await current_frame.locator(css_selector).element_handle()
+				element_handle = await current_frame.locator(css_selector).element_handle()
+				return element_handle
 			else:
 				# Try to scroll into view if hidden
 				element_handle = await current_frame.query_selector(css_selector)
 				if element_handle:
 					await element_handle.scroll_into_view_if_needed()
 					return element_handle
+				return None
 		except Exception as e:
 			logger.error(f'Failed to locate element: {str(e)}')
 			return None
@@ -901,14 +918,14 @@ class BrowserContext:
 				await self._update_state(focus_element=element_node.highlight_index)
 
 			page = await self.get_current_page()
-			element = await self.get_locate_element(element_node)
+			element_handle = await self.get_locate_element(element_node)
 
-			if element is None:
+			if element_handle is None:
 				raise Exception(f'Element: {repr(element_node)} not found')
 
-			await element.scroll_into_view_if_needed(timeout=2500)
-			await element.fill('')
-			await element.type(text)
+			await element_handle.scroll_into_view_if_needed(timeout=2500)
+			await element_handle.fill('')
+			await element_handle.type(text)
 			await page.wait_for_load_state()
 
 		except Exception as e:
@@ -925,9 +942,9 @@ class BrowserContext:
 			if element_node.highlight_index is not None:
 				await self._update_state(focus_element=element_node.highlight_index)
 
-			element = await self.get_locate_element(element_node)
+			element_handle = await self.get_locate_element(element_node)
 
-			if element is None:
+			if element_handle is None:
 				raise Exception(f'Element: {repr(element_node)} not found')
 
 			async def perform_click(click_func):
@@ -955,15 +972,13 @@ class BrowserContext:
 					await page.wait_for_load_state()
 					await self._check_and_handle_navigation(page)
 
-			# await element.scroll_into_view_if_needed()
-
 			try:
-				return await perform_click(lambda: element.click(timeout=1500))
+				return await perform_click(lambda: element_handle.click(timeout=1500))
 			except URLNotAllowedError as e:
 				raise e
 			except Exception:
 				try:
-					return await perform_click(lambda: page.evaluate('(el) => el.click()', element))
+					return await perform_click(lambda: page.evaluate('(el) => el.click()', element_handle))
 				except URLNotAllowedError as e:
 					raise e
 				except Exception as e:
@@ -1033,7 +1048,8 @@ class BrowserContext:
 
 	async def get_element_by_index(self, index: int) -> ElementHandle | None:
 		selector_map = await self.get_selector_map()
-		return await self.get_locate_element(selector_map[index])
+		element_handle = await self.get_locate_element(selector_map[index])
+		return element_handle
 
 	async def get_dom_element_by_index(self, index: int) -> DOMElementNode | None:
 		selector_map = await self.get_selector_map()
